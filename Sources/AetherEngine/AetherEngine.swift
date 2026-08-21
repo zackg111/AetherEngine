@@ -1295,6 +1295,17 @@ public final class AetherEngine: ObservableObject {
         activeProducerShiftSeconds - playlistShiftSeconds
     }
 
+    /// Diagnostics only. The loopback HLS master playlist URL the internal AVPlayer is being asked to play
+    /// (`http://127.0.0.1:<port>/master.m3u8`), or nil on SW/audio sessions and after teardown. Lets a host
+    /// capture the served master/media/init bytes on a startup-timeout path before it tears the engine down,
+    /// turning an opaque AVFoundation `-12884` into the actual playlist/sample-entry that was rejected. The
+    /// server is still live until `stop()`; fetch synchronously before stopping. Not for playback logic.
+    public var loopbackMasterURL: URL? { nativeVideoSession?.masterPlaylistURL }
+
+    /// Diagnostics twin of `loopbackMasterURL` for the media (variant) playlist (`.../media.m3u8`). Same
+    /// lifetime and caveats. Not for playback logic.
+    public var loopbackMediaURL: URL? { nativeVideoSession?.mediaPlaylistURL }
+
     /// `currentTime - sourceTime`. Positive while a native seek is in flight: currentTime holds the seek target
     /// while sourceTime tracks AVPlayer's rendered position. This is the AetherEngine#49 divergence measured
     /// by rrgomes on-device. Distinct from `frameAhead` (producer-shift fold). Diagnostics only.
@@ -1868,6 +1879,16 @@ public final class AetherEngine: ObservableObject {
     static let startupGateInitialSeconds: Double = 3.0
     static let startupGateReloadSeconds: Double = 3.0
     static let startupGateMediaSeconds: Double = 2.5
+
+    /// Item 1: contiguous segments the initial producer must cache before the common-path play(), so the
+    /// internal AVPlayer's buffering-rate estimator sees instant full-speed local delivery rather than a
+    /// bursty on-demand seg0 warm-up. Two (init + seg0 + seg1) gives the estimator a real throughput
+    /// sample; larger only delays startup with no added certainty.
+    static let startupPrimeSegmentCount = 2
+    /// Bound on the item-1 prime wait. The first segments land in tens of ms on a healthy link; this is
+    /// generous headroom yet far under the host's 20s startup watchdog, and on timeout the load proceeds
+    /// with the historical unconditional play() so a slow first segment never blocks startup.
+    static let startupPrimeSegmentTimeoutSeconds: TimeInterval = 2.5
 
     /// First settle window on a wireless AirPlay hop (#227 follow-up). The receiver fetches across the LAN
     /// and runs its own decode handshake before anything is playable, which the local 3 s window can miss.
@@ -3554,7 +3575,30 @@ public final class AetherEngine: ObservableObject {
                         try await runStartupReadinessGate(
                             session: session, position: startPosition ?? 0, gen: gen)
                     } else {
+                        // Item 1: on the common (non-DV/AirPlay) path, hold play() until the producer has
+                        // the first segments cached, so AVPlayer's rate estimator escapes
+                        // AVPlayerWaitingWhileEvaluatingBufferingRateReason immediately instead of hanging
+                        // on a bursty on-demand seg0 warm-up (the intermittent -12884 startup failure).
+                        // Bounded; on timeout we fall through to the historical unconditional play(). VOD
+                        // only — live has its own edge/holdback startup gating.
+                        if let session = nativeVideoSession, !options.isLive {
+                            let primed = await session.awaitInitialSegmentsCached(
+                                minCount: Self.startupPrimeSegmentCount,
+                                timeout: Self.startupPrimeSegmentTimeoutSeconds)
+                            try checkLoadCurrent(gen)
+                            if !primed {
+                                EngineLog.emit(
+                                    "[AetherEngine] startup prime: producer did not cache "
+                                    + "\(Self.startupPrimeSegmentCount) segments within "
+                                    + "\(Self.startupPrimeSegmentTimeoutSeconds)s; playing anyway",
+                                    category: .session)
+                            }
+                        }
                         nativeHost?.play()
+                        // Item 3: safety net if a primed start still wedges before the first frame.
+                        if !options.isLive {
+                            armStartupNudgeWatchdog(gen: gen, position: startPosition ?? 0)
+                        }
                     }
                     state = .playing
                     // #227: a receiver that refuses the playlist it was handed neither fails the item nor
@@ -4516,6 +4560,19 @@ public final class AetherEngine: ObservableObject {
     static let airPlayMasterAttempts = 2
     private var airPlayProgressWatchdog: Task<Void, Never>?
 
+    /// Item 3 startup nudge (safety net for the buffering-rate startup race). The item-1 producer-ready gate
+    /// almost always prevents the wedge, but the bug was intermittent, so this catches any residual: if a
+    /// primed common-path start has not reached its first frame within `startupNudgeWatchdogSeconds`, one
+    /// `reengageStalledConsumer` nudge (a zero-tolerance seek that rebuilds AVFoundation's loading pipeline)
+    /// self-heals it — turning a would-be 20s-timeout→transcode into a ~1s recovery. Fires at most once per
+    /// load; a healthy start (mirror already true) or a superseded load is a no-op.
+    private var startupNudgeWatchdog: Task<Void, Never>?
+
+    /// Item 3 threshold: chosen past the ~2.9s DisplayCriteria panel mode-switch that legitimately holds a
+    /// healthy start in `waitingToPlay`, so the nudge only fires on a genuine wedge (never reached `.playing`),
+    /// never mid-switch. A healthy start is `.playing` by ~t+3s, so its first-frame mirror is set before this.
+    static let startupNudgeWatchdogSeconds: Double = 4.0
+
     private var displayModeDiagnostic: Task<Void, Never>?
 
     /// Sodalite #49: read back what the Match-Frame-Rate switch actually landed on. `preferredDisplayCriteria`
@@ -4564,6 +4621,33 @@ public final class AetherEngine: ObservableObject {
         #else
         return nil
         #endif
+    }
+
+    /// Item 3 (safety net for the buffering-rate startup race, [[goody-startup-buffering-race]]): after a
+    /// primed common-path autostart, watch for the first frame; if it never lands within the threshold — the
+    /// residual `AVPlayerWaitingWhileEvaluatingBufferingRateReason` / `WaitingToMinimizeStalls` wedge that the
+    /// item-1 gate mostly prevents — fire ONE `reengageStalledConsumer` nudge. The nudge's zero-tolerance seek
+    /// rebuilds AVFoundation's loading pipeline (the same effect the resume-seek had when it accidentally
+    /// dodged the wedge), so a would-be 20s-timeout→transcode becomes a ~1s recovery. VOD only.
+    @MainActor
+    func armStartupNudgeWatchdog(gen: UInt64, position: Double) {
+        startupNudgeWatchdog?.cancel()
+        startupNudgeWatchdog = nil
+        startupNudgeWatchdog = Task { @MainActor [weak self] in
+            let seconds = AetherEngine.startupNudgeWatchdogSeconds
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self, !Task.isCancelled, self.loadGeneration == gen else { return }
+            // Healthy start: the mirror is set on the first `.playing`, which a good start reaches by ~t+3s
+            // (before this threshold), so nudging is skipped. A dead item is handled by the host's own error
+            // path; reengageStalledConsumer additionally no-ops a paused player.
+            guard !self.hasRenderedFirstFrameMirror.get() else { return }
+            EngineLog.emit(
+                "[AetherEngine] item 3 startup nudge: no first frame after "
+                + "\(String(format: "%.0f", seconds))s on a primed start; nudging the consumer to rebuild "
+                + "the loader (residual buffering-rate wedge)",
+                category: .session)
+            self.reengageStalledConsumer(position: position, trigger: "startup nudge")
+        }
     }
 
     /// Arm the progress watchdog for a load that handed the receiver a playlist with subtitle renditions.
@@ -5156,6 +5240,8 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleRenditionsServed = false
         airPlayProgressWatchdog?.cancel()
         airPlayProgressWatchdog = nil
+        startupNudgeWatchdog?.cancel()
+        startupNudgeWatchdog = nil
         displayModeDiagnostic?.cancel()
         displayModeDiagnostic = nil
         airPlayServedMasterToReceiver = false

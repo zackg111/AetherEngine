@@ -1892,6 +1892,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return max(0, (seg.startSeconds + seg.durationSeconds) - playlistSeconds)
     }
     var producerRestartCount: Int { subsystemSnapshot().producer?.restartCount ?? 0 }
+
+    /// Item 1 startup prime: suspend until the initial producer has `minCount` contiguous segments cached
+    /// from its anchor (`initialProducerBaseIndex`), or `timeout` elapses. Handing the internal AVPlayer a
+    /// loopback URL whose first segments already sit in `SegmentCache` lets its buffering-rate estimator
+    /// measure instant full-speed local delivery and leave `AVPlayerWaitingWhileEvaluatingBufferingRateReason`
+    /// at once, instead of judging a bursty on-demand seg0 warm-up — the state the intermittent startup
+    /// failure hangs in permanently before `asset.load(duration)` fails -12884. Returns true once the depth
+    /// is met, false on timeout; the caller then plays anyway (historical behaviour), so a slow or
+    /// unproducible first segment never blocks startup longer than it did before. Poll-based (no new pump
+    /// signalling); `SegmentCache` reads are lock-guarded. Cheap: a couple of segments land in tens of ms on
+    /// a healthy link, so the loop almost always returns on its first or second tick.
+    func awaitInitialSegmentsCached(minCount: Int, timeout: TimeInterval) async -> Bool {
+        guard minCount > 0 else { return true }
+        let base = initialProducerBaseIndex
+        let deadline = Date().addingTimeInterval(timeout)
+        // contiguousForwardFrontier returns base-1 when seg[base] is still absent, so depth is 0 until it lands.
+        func cachedDepth() -> Int {
+            guard let cache = subsystemSnapshot().cache else { return 0 }
+            return cache.contiguousForwardFrontier(from: base) - base + 1
+        }
+        while cachedDepth() < minCount {
+            if Date() >= deadline { return false }
+            try? await Task.sleep(nanoseconds: 20_000_000)  // 20ms
+        }
+        return true
+    }
+
     var muxedBytesLifetime: Int { subsystemSnapshot().producer?.muxerLifetimeFragmentBytes ?? 0 }
     var serverLifetimeBytesSent: Int { subsystemSnapshot().server?.lifetimeBytesSent ?? 0 }
     var serverRequestCount: Int { subsystemSnapshot().server?.requestCount ?? 0 }
