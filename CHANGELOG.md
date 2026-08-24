@@ -12,6 +12,214 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.39.0] - 2026-08-24
+
+### Fixed
+
+- **A seek waited 12 s on a target nothing was serving, because the reading it waited on did not
+  mean what it claimed (AE#408).** `bufferedSecondsAtTarget` summed every loaded range intersecting
+  `[target - 1 s, target + 30 s]`, so a band loaded well downstream of the target counted, at full
+  weight, as media at the target. That is the only reading consistent with the report: `island=7.30s
+  at target` next to `rendered == bufferedEnd` and a seek that never landed, when 7.3 s of media
+  actually covering the target would have landed it. The first deadline extension is granted on
+  presence alone (there is no earlier sample to compare against), so a phantom island bought 4 s on
+  top of the 8 s budget, on every instance, deterministically. Coverage of the target is now a gate
+  on the reading; the window keeps its width, because measuring how deep the served region runs is
+  what separates a producer still filling from one that served a little and stopped. In the reported
+  shape the island reads 0, below `nativeSeekProgressIslandFloorSeconds`, so no extension is granted
+  and the deadline goes straight to the re-anchor.
+- **A backward seek into cache-resident content left the producer aimed somewhere else (AE#408).**
+  The proactive re-anchor on a backward target jump is skipped when the target segment is still
+  resident, a gate that exists for the Continuous-Audio handover refetch, where an unconditional
+  restart re-arms the FLAC bridge and glitches the audio. Residency of the target segment alone does
+  not carry that: a scrub band left by an earlier pump is resident too, and it ends. Nothing else
+  aimed the pump at the new target, so the band running out was what finally did, which pays the
+  whole re-anchor at the one moment the buffer is empty. Reproduced headless (`aetherctl play`,
+  backward seek to seg38 into a three-segment band while the pump was anchored at seg99): the ask
+  for seg41 arrived 4 s later with 5 s of buffer left; on a longer band the pump instead sat parked
+  for 24 s until the #65 backpressure wedge breaker moved it. The gate now holds only while the
+  resident run reaches the active march front (no gap to fall into, the handover case) or is at
+  least a prefetch window deep (the gap is asked for with a full cushion, and re-anchoring early
+  would re-produce content already on disk). On the same repro the pump now restarts at seg38 while
+  the band is still serving. Reported by @rrgomes.
+
+## [6.38.0] - 2026-08-24
+
+### Fixed
+
+- **A decoded frame with no timestamp of its own was refused rather than repaired (AE#407).** The
+  software path had a drop for an untimed frame at two layers (the deinterlacer discards its own
+  untimestamped output, `SampleBufferRenderer.enqueue` refuses a sample the render synchronizer
+  cannot pace and whose NaN would reorder its neighbours) and no repair between them, so the only
+  thing standing between an untimed picture and a dropped one was the demuxer's `+genpts`, one flag
+  on one open. The direct path now reads `best_effort_timestamp` when the decoder set no PTS, which
+  is libavcodec's own `guess_correct_pts(pts, pkt_dts)` and the reconstruction every other
+  FFmpeg-based player consumes. It is placed directly after `avcodec_receive_frame`, so captions,
+  the filter graph and the emit path all see one repaired timestamp rather than each reading the raw
+  field separately, and a frame carrying neither value still falls through to the gate, because
+  inventing a position is worse than losing a picture. Two shapes reach the decoder untimed on their
+  own: Matroska `V_MS/VFW/FOURCC` tracks, where `matroskadec.c` writes the block time to DTS and
+  leaves `pkt->pts` unset (which is how VC-1 and the legacy Microsoft codecs are stored), and live
+  MPEG-TS, which delivers untimed pictures outright. Measured on a VC-1 Matroska fixture with
+  `+genpts` suppressed: before, every frame was refused at the enqueue gate, no picture appeared and
+  the demux loop ran a 58 s file dry in 2.5 s because nothing paced it; after, 25 enqueues per second
+  on a 25 fps source and a clock that advances. With `+genpts` on, the repair never fires and nothing
+  changes. Reported by @classicjazz.
+
+## [6.37.0] - 2026-08-23
+
+### Fixed
+
+- **The live no-cut stall watchdog was inline in the read loop it watches (AE#406).** It ticked
+  between `av_read_frame` calls, and `av_read_frame` does not return before a whole packet is
+  assembled; the format context carries no `interrupt_callback`, so that call has no upper bound at
+  all. An origin too slow to complete one packet inside the watchdog window therefore did not make
+  the watchdog late, it made it unable to run, which is structurally the defect #309 fixed on the
+  reader side (where the precondition that had to go was "a consumer must be blocked on it").
+  Measured against a loopback origin that delivers 100 bytes once a second for 45 s on the
+  connection it already holds: 6.36.0 classified the stall at 46 s and emitted the line 0 ms after a
+  46642 ms read returned, so the 11 s of overrun on its 35 s window were exactly the time the read
+  was blocked. The window state now lives in `NoCutStallWatchdog`, which the read thread reports
+  into and a 1 s timer evaluates, and the verdict aborts the parked read through the same
+  `markClosed()` the reopen path already uses on a wedged read. Same origin, same run: the stall is
+  classified at 35 s while the read is still parked, and the host retune arrives 11.4 s earlier. The
+  classifier, the thresholds and the log vocabulary are unchanged, and a deliberately parked pump
+  (the live headroom park) is not judged, so a consumer that stopped polling is never reported as a
+  source that stopped delivering. Live sessions only. Reported by @tschuegy.
+
+## [6.36.0] - 2026-08-23
+
+### Fixed
+
+- **The live stall ladder replaced the consumer's item without ever asking the producer (AE#405).**
+  Stage 2 of the `#65` ladder gated on consumer fetches and on the position budget, and both are
+  silent in the two cases it has to tell apart. On a field trace from a one-slot Xtream host it
+  reloaded an unchanged local playlist while the source was still re-resolving: AVPlayer rejoined a
+  frozen playlist at edge-minus-holdback, five seconds behind the frozen position, replayed the tail
+  it had already shown and parked again, and the retune the host needed waited out two more grace
+  windows (~12 s). The count of segments the producer has finalized is the one fact that separates
+  "the consumer died under a healthy producer", where a fresh item is exactly right, from "the
+  producer is starved", where it replays the tail; it was available and unconsulted. Stage 2 now
+  skips straight to `liveSourceReset` when nothing has been finalized since the stall. A session
+  with no local producer at all (a remote HLS route AVPlayer fetches itself) reports nil rather than
+  zero and keeps its old behaviour, since the absence of a producer to ask is not an answer from one.
+- **A 407 from a pinned redirect target was an untyped refusal (AE#405).** It fell through the
+  expiry, rate-limit and hard-error classifiers alike: no pin drop from the status, charged against
+  the full mid-stream reconnect cap, and the pin dropped only later by the unproductive-streak rule,
+  so the attempt right after the refusal went back to the address that had just refused. On a
+  redirect chain 407 cannot mean "authenticate to your proxy", because the request went out direct
+  (which is why CFNetwork logs it as an unexpected proxy response) and a configured proxy is answered
+  by URLSession's own auth challenge long before a status reaches the reader. It means the lease is
+  gone or an interception answered in its place, and one re-resolve through the source is the move
+  that works. 402 and 451 join it as the same shape. Rate-limit statuses stay out: there the origin
+  is metering us and the pin is fine.
+- **A source that renumbered its clock from zero was absorbed as a programme boundary (AE#405).**
+  When a live origin restarts its stream from its ring buffer with raw dts back at zero, FFmpeg's
+  33-bit wrap correction turns that into a dts of exactly 2^33, so it arrives as a large FORWARD
+  jump. `isSourceReplay` opened with `guard jumpTicks < 0` and never looked at it: the restart was
+  absorbed behind an `EXT-X-DISCONTINUITY` and the session re-served eleven seconds it had already
+  played (segments byte-identical in size to the ones five earlier). The anchor is the subtle part.
+  A rewind lands near the first dts this session saw, because the server restarted the programme; an
+  axis reset lands near zero no matter where the session joined the ring, and in the trace those are
+  1121 s apart. The classifier now recognizes both shapes and ends the pump for a host retune on
+  either. The axis reset requires no recent reconnect (the origin renumbers on the connection it
+  already holds; measured `gen=1->1`, `reconnects=0`) and is live-only, since a sequential origin's
+  archive chunks legitimately open their own axis at zero.
+
+All three reported by tschuegy from a Syravo device trace on tvOS 26.6.
+
+## [6.35.0] - 2026-08-23
+
+### Added
+
+- **The session publishes which codec and container it opened.** A host could ask what is decoding
+  (`activeVideoDecoder`) but not what was opened: the codec name existed at load and in `SourceProbe`,
+  and the live session published neither, so a stats panel had to fall back on the host's own catalogue
+  metadata. That metadata describes the file a library holds, which under a remux or a transcode is not
+  what arrived, and a host whose item payload happens to be slim has nothing to show at all.
+  `sourceVideoCodecName` carries the libavcodec spelling ("hevc", "h264", "av1"); the probe path takes it
+  from `avcodec_get_name` and the probe-free remote-HLS bypass maps the item's video sample type back to
+  the same word, so one field means one thing on every route. `sourceContainerFormat` carries what
+  libavformat opened ("matroska,webm", "mpegts"), nil on the bypass where there is no libav context to
+  ask. Verified against h264/mp4, h264/mkv, hevc/mp4 and h264/mpegts.
+- **`aetherctl play` prints a `SOURCE` line** with those fields plus dimensions, frame rate, bitrate and
+  dynamic range, read from the session rather than from a separate probe, because the session is what a
+  host panel binds to and the two can disagree.
+
+### Changed
+
+- **`sourceVideoWidth` / `sourceVideoHeight` are `@Published`.** They were readable but silent, so a
+  SwiftUI panel bound to them never refreshed, including across the audio-switch reload that can change
+  them.
+
+## [6.34.1] - 2026-08-22
+
+### Added
+
+- **A startup witness for which FFmpeg the engine is actually executing against (AE#396).** The engine
+  calls `avcodec_*` as ordinary external symbols, so which binary serves them is decided by the host
+  executable's link, not by the package graph: a static FFmpeg pulled in with `-force_load` becomes a
+  definition inside the executable and beats every dylib, and a dependency exporting the same symbols
+  (libVLC does) wins whenever the build system sorts it ahead of a vendored framework. AE#396 was
+  reported as a bridged-audio defect across five fixtures, three codecs and two containers, and was a
+  second libavcodec one major behind. Every session now opens with the four loaded versions, and a
+  major that does not match the headers the engine compiled against turns that line into an `ERROR:`
+  naming the mismatch, the two shapes that cause it, the `nm -m` / `otool -L` probes, and the configure
+  line of the libavcodec that answered. All four linked libraries are checked; libavutil matters most,
+  since a major shift there moves struct layouts. Reported and diagnosed by @kskchaitanya1993.
+
+### Changed
+
+- **The bridge-encoder cascade names the libavcodec that answered instead of "this FFmpeg build"
+  (AE#396).** The old sentence was true and pointed away from the cause: the build missing
+  `--enable-encoder=flac` was the host's second FFmpeg, not the engine's.
+
+### Documentation
+
+- **A linking contract in `docs/api.md`**, plus the README's static-linking and diagnostics sections.
+  Being dynamically embedded is not the same as being reached.
+
+## [6.34.0] - 2026-08-21
+
+### Fixed
+
+- **The software-path audio tap trapped on the FIRST buffer of every multichannel track (AE#400).**
+  `AudioTapPCMConverter` rebuilt its input format from the channel count alone and force-unwrapped the
+  result, but `AVAudioFormat(commonFormat:sampleRate:channels:interleaved:)` returns nil for every count
+  above 2 (measured 3 through 8; this is AVFAudio behaviour on every platform, not a macOS specialty).
+  `AudioDecoder` emits the source layout up to 7.1 without downmixing, so this was not a race: any
+  multichannel track on the software path with a tap installed trapped on its first audio buffer. The
+  layout the converter needed was already attached to the sample buffer's format description by the
+  decoder, so it is read back from there now instead of being re-derived, with the engine's own mapping
+  as a fallback for a description that carries none. Reported by dlev02 from a Prism TestFlight crash.
+- **Some channel layouts convert to digital silence without reporting an error, which the crash had been
+  hiding (AE#400).** Measured: 4-channel Quadraphonic and every DiscreteInOrder layout produce a buffer
+  of zeroes with no `NSError` set, which at a tap consumer is indistinguishable from a muted source. The
+  converter now pushes one full-scale buffer through each new converter and folds the channels itself
+  when the answer is silence. The check sits on the measured behaviour rather than on a table of the
+  layouts Apple currently mixes, because such a table goes stale without saying so.
+- **The channel layout stamped on software-path audio now names the order the resampler actually wrote
+  (AE#401).** `AudioDecoder` resamples into `av_channel_layout_default(channels)` and stamped a layout
+  from a second, independent table; the two agreed only for 5.0 and 5.1. Measured per channel through a
+  real downmix: on 7.1 every channel moved and the LFE, a bass-only channel, was placed hard left at full
+  gain; on 4.0 the centre, which carries dialogue, went hard left; on 2.1 the LFE was mixed into both
+  channels instead of being dropped. 5.1 being the common multichannel case is most likely why it went
+  unseen. 7.1 is also where the mistake came from: the old comment called `AAC_7_1` "MPEG_7_1_C,
+  Hollywood L R C LFE Ls Rs Lsr Rsr", but those are two different layouts. Fixed by naming what is
+  already in the buffer (`WAVE_2_1`, `MPEG_4_0_A`, `MPEG_7_1_C`) rather than by moving the audio; 6.1 is
+  the one count no CoreAudio tag matches, so there the resampler is pointed at `6.1(back)` instead.
+  Covered by `ChannelLayoutOrderTests`, which compares placement through a real downmix and not names.
+
+### Added
+
+- **`aetherctl audiotap --software`, a headless driver for the tap path that had none.** The two existing
+  modes drive their readers directly, so the software sink, which only exists inside a real session, could
+  not be run from the CLI at all. That is how AE#400 shipped and survived: every path around it had a
+  harness. The new mode loads the source through the whole engine, refuses it if it did not route to the
+  software host, installs the tap through the public `installAudioTap()` and plays. It reports `peak` next
+  to the buffer count, and exit 3 covers both no buffers and buffers of digital silence, because both look
+  like a healthy run otherwise. `AudioTapProbe.runSoftware` backs it.
+
 ## [6.33.0] - 2026-08-20
 
 ### Changed

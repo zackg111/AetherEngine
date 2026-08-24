@@ -164,9 +164,11 @@ Plays a source through the audio-only pipeline (default ten seconds, `--seconds 
 
 ## audiotap
 
-    aetherctl audiotap [--duration S] [--out PATH.wav] [--remote] <url>
+    aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
 
 Brings up the loopback session headless, decodes the audio tap (#95) as fast as segments are produced, writes mono Float32 48 kHz WAV (default `/tmp/audiotap.wav`), and prints buffer count, PCM seconds, discontinuity count, and the covered `sourceTime` span. A clean run reports exactly one discontinuity (the install itself). `--remote` drives the remote-HLS delivery path instead (direct AVPlayer ingest of an HLS url, no loopback): rendition/variant resolution, segment fetch + decrypt, playhead-follow decode. Verification tool for the PCM audio tap across the stream-copy and bridge audio paths.
+
+`--software` drives the third delivery path, the SW sink (`AudioTapPCMConverter`), which the other two modes cannot reach: they drive their readers directly, while the sink only exists inside a real session. This mode therefore loads the source through the whole engine, fails if it did not route to the software host, installs the tap through the public `installAudioTap()` and plays, so the sink runs exactly as it does in a host. It is bound to wall clock (the SW host decodes in real time), and it reports `peak` next to the buffer count because the two ways this path fails look identical in a report otherwise: **exit 3 covers both no buffers at all and buffers of digital silence**, which at a consumer is indistinguishable from a muted source. That gap is not hypothetical. With no harness here, a force unwrap that trapped on the FIRST buffer of any multichannel track shipped in 6.1.3 and survived to main (#400), and the silent-downmix defect underneath it only became visible once the trap was gone. Software routing needs a source the native path declines, e.g. `ffmpeg -f lavfi -i testsrc2 -f lavfi -i sine -c:v libvpx-vp9 -c:a aac -shortest clip.mkv`; add `-af "pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0"` for the multichannel case and `-af "pan=quad|c0=c0|c1=c0|c2=c0|c3=c0"` for the layout AVAudioConverter refuses to mix.
 
 ## bgaudio
 
@@ -194,9 +196,30 @@ Runs the rewind matrix across the native and SW paths (`--path native|sw|both`).
 
 ## hlsfixture
 
-Slices a local `.ts` into a sliding live HLS playlist and serves it over loopback, with fault knobs (`--master` indirection, `--codecs`, `--resolution`, `--discontinuity-at`, `--slow-refresh`, `--drop-segment`, `--encrypted`, `--fmp4`, `--port`, `--segment-seconds`) and a `--self-test` mode that runs `HLSLiveIngestReader` against it end to end. Every request is logged as one `[HLSFixture] REQ <path>` line, so what a load actually costs the origin is countable rather than arguable.
+Slices a local `.ts` into a sliding live HLS playlist and serves it over loopback, with fault knobs (`--master` indirection, `--codecs`, `--resolution`, `--discontinuity-at`, `--slow-refresh`, `--drop-segment`, `--encrypted`, `--fmp4`, `--port`, `--segment-seconds`, `--target-duration`, `--window`) and a `--self-test` mode that runs `HLSLiveIngestReader` against it end to end. Every request is logged as one `[HLSFixture] REQ <path>` line, so what a load actually costs the origin is countable rather than arguable.
 
 `--segments-dir <dir>` serves pre-cut segments (`ffmpeg -i in.ts -c copy -f hls -hls_time 4 -hls_flags independent_segments -hls_segment_filename seg%d.ts out.m3u8`) instead of byte slices, sorted numerically. Byte slices start mid-GOP, which is fine for "did it route" and useless for "did it play": the run rebuffers forever because nothing decodes. Use the directory whenever the question is playthrough.
+
+### The advertised TARGETDURATION and the window depth (AE#374)
+
+`--target-duration N` advertises a `#EXT-X-TARGETDURATION` independent of the real cut size, and `--window N` sets how many segments the sliding window keeps visible (default 6, minimum 3). Packagers commonly pad the target duration (`segment + 1`) to widen a client's patience for an unchanged playlist, and a downstream host asked whether that padding was what its live joins were paying for. Neither shape could be expressed here, so the question could not be answered by measurement at all.
+
+Measured against pre-cut GOP-aligned segments, `play --live --fast-zap` entered on a saturated window, three passes per row, engine 6.34.1:
+
+| origin cut | advertised TD | window | served TD | first serve held |
+|---|---|---|---|---|
+| 2 s | 3 (padded) | 3 | 3 | 2.004 / 2.010 / 2.010 s |
+| 2 s | 2 (`ceil(max EXTINF)`) | 3 | **3** | 2.010 s, three times |
+| 2 s | 3 | 5 | 3 | 2.001 / 2.007 / 2.010 s |
+| 2 s | 5 (over-padded) | 3 | **5** | 2.010 s, three times |
+| 1 s | 2 (padded) | 3 | 2 | 1.001 / 1.010 / 1.010 s |
+| 1 s | 1 (`ceil(max EXTINF)`) | 3 | **2** | 1.005 / 1.007 / 1.010 s |
+| 1 s | 2 | 7 | 2 | 1.003 / 1.005 / 1.010 s |
+| 0.5 s GOP inside 1 s segments | 2 | 3 | 2 | **0.510 s, three times** |
+
+Removing the padding changes nothing. The served TARGETDURATION is `max(advertised, ceil(observed arrival cadence), ceil(max own EXTINF), ceil(1.5 x cut target))`, and a strict-realtime origin's real inter-arrival gap is always a hair above the nominal cut, so the `ceil` lands on `cut + 1` whether or not the origin advertises it. Deepening the window changes nothing either: the ingest joins exactly three segments behind the edge at window 3, 5 and 7, so a deeper upstream window never becomes a deeper cushion. What moves is the cut, because the fastZap grace is `min(2.0, max(0.5, own cut duration))` and the engine re-cuts at the source GOP.
+
+Over-padding costs somewhere else than the join. TD 5 on 2 s cuts still serves in 2.010 s, because the bounded fastZap exit fires on the grace either way, but the served playlist then carries a 15 s holdback, so AVPlayer targets that far behind the live edge for the rest of the session.
 
 ### The header-enforcing origin (AE#363)
 
